@@ -1,0 +1,409 @@
+# inspect_pkl
+
+import pickle
+from pathlib import Path
+import pandas as pd
+import numpy as np
+'''
+def inspect_pkl(tables:dict) -> None:
+    pkl_path = Path(r"D:\數據分析科\鷹眼\data\.cache\特徵工程完成後中繼資料.pkl")
+    
+    with open(pkl_path, 'rb') as f:
+        data = pickle.load(f)
+    
+    print("PKL type:", type(data))
+    print()
+    
+    # 如果是dict (最常見)
+    if isinstance(data, dict):
+        print('Tables inside PKL:')
+        for k, v in data.items():
+            print('-'*40)
+            print("key:", k)
+            print("type:", type(v))
+            if isinstance(v, pd.DataFrame):
+                print("shape", v.shape)
+                print("columns", v.columns.tolist())
+    
+    # 如果直接是DataFrame
+    elif isinstance(v, pd.DataFrame):
+        print("This PKL is a single DataFrame")
+        print(data.shape)
+        print(data.columns.to_list())
+    
+    else:
+        print("Unknown Structure")
+'''
+# =====================================================================================================================
+
+# ----------                                       選擇欄位有Label 作為建模主表                                   ------
+
+#  =====================================================================================================================
+
+
+from xgboost import XGBClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    classification_report, #
+    roc_auc_score,         # ROC curve
+    confusion_matrix,      # Confusion Matrix
+)
+from sklearn.impute import SimpleImputer
+import joblib
+
+#from sklearn.impute import SimpleImputer
+
+# =========================
+# 1. 基本設定
+# =========================
+PKL_PATH = Path(r"D:\數據分析科\鷹眼\data\.cache\特徵工程完成後中繼資料.pkl")
+MODEL_PATH = Path(r"D:\數據分析科\鷹眼\data\.cache\hawkeye_xgb_model.pkl")
+FEATURE_IMPORTANCE_PATH = Path(r"D:\數據分析科\鷹眼\data\.cache\hawkeye_feature_importance.csv")
+print(FEATURE_IMPORTANCE_PATH.exists())
+LABEL_COL = "label"
+
+# 若你的主表 key 不是這個，改這裡
+#MAIN_TABLE_KEY = "訓練或預測資料集"
+
+# 因為需要重新切割交易日期，故選擇該張報表 2026/3/10
+MAIN_TABLE_KEY = "特徵"
+
+# 明顯不該直接進模型的欄位
+DROP_COLS = [LABEL_COL, "交易日期", "帳號",
+              "客戶身分證或統編", "交易日期時間", "轉入或轉出交易",
+              "交易分別行", "交易筆次", "Session", "Flow",
+              "開戶日期" ]
+'''
+DROP_COLS = [
+    LABEL_COL,
+    "acct_nbr_ori",
+    "AccNo",
+    "IssueDt",
+    "DATA_DT",
+    "customer_id",
+    "cust_id",
+]
+'''
+RANDOM_STATE = 42
+TEST_SIZE = 0.2
+
+
+# =========================
+# 2. 輔助函式
+# =========================
+def print_basic_info(df: pd.DataFrame) -> None:   # -> None (型別註記)不會印出任何資料
+    print("=" * 60)
+    print("Data shape:", df.shape)
+    print("Columns count:", len(df.columns))
+    print("First 10 columns:", df.columns.tolist()[:10])
+    print("=" * 60)
+
+    if LABEL_COL in df.columns:
+        print("Label distribution:")
+        print(df[LABEL_COL].value_counts(dropna=False))
+        print(df[LABEL_COL].value_counts(normalize=True, dropna=False))
+        print("=" * 60)
+
+
+def find_main_table(tables: dict) -> pd.DataFrame:
+    print("Available table keys:")
+    for k, v in tables.items():
+        if isinstance(v, pd.DataFrame):
+            print(f"- {k}: shape={v.shape}")
+        else:
+            print(f"- {k}: type={type(v)}")
+
+    # 檢查是否為DataFrame
+    if MAIN_TABLE_KEY in tables:
+        df = tables[MAIN_TABLE_KEY]
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError(f"{MAIN_TABLE_KEY} 不是 DataFrame")
+        return df
+
+    raise KeyError(
+        f"找不到主表 key: {MAIN_TABLE_KEY}，請先看上方 keys 後修改 MAIN_TABLE_KEY"
+    )
+
+
+def prepare_xy(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+    if LABEL_COL not in df.columns:
+        raise KeyError(f"找不到標籤欄位：{LABEL_COL}") # 無key值
+
+    y = df[LABEL_COL].copy()
+
+    # 只保留 0 / 1
+    valid_mask = y.isin([0, 1])
+    df = df.loc[valid_mask].copy()
+    y = y.loc[valid_mask].copy().astype(int)
+
+    # 先移除不該進模型的欄位
+    X = df.drop(columns=DROP_COLS, errors="ignore").copy()
+
+    # 先只留數值與布林欄位
+    X = X.select_dtypes(include=["number", "bool"]).copy()
+
+    # 布林轉成 0/1
+    bool_cols = X.select_dtypes(include=["bool"]).columns.tolist()
+    if bool_cols:
+        X[bool_cols] = X[bool_cols].astype(int)
+
+    # 去掉全空欄
+    X = X.dropna(axis = 1, how = "all")
+
+    print("Prepared X shape:", X.shape)
+    print("Prepared y shape:", y.shape)
+    print("Positive count", int((y == 1).sum()))
+    print("Negative count", int((y == 0).sum()))
+    return X, y
+
+def split_and_impute(
+        X_train: pd.DataFrame,  # 型別提示 也可以只寫x
+        X_test: pd.DataFrame
+        ):
+        #test_size = TEST_SIZE,
+        #random_state = RANDOM_STATE) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series,pd.Series,SimpleImputer]:
+
+        # 缺值補中位數
+        imputer = SimpleImputer(strategy = "median")
+        X_train_imputed = pd.DataFrame(
+            imputer.fit_transform(X_train),
+            columns = X_train.columns,
+            index = X_train.index
+        )
+        X_test_imputed = pd.DataFrame(
+            imputer.transform(X_test),
+            columns = X_test.columns,
+            index=X_test.index
+        )
+
+        print("X_train_imputed shape:", X_train_imputed.shape)
+        print("X_test_imputed shape:", X_test_imputed.shape)
+        #print("y_train Positive:", int((y_train == 1).sum()))
+        #print("y_test Positive:", int((y_train == 1).sum()))
+        return X_train_imputed, X_test_imputed, imputer  #為了保持後續新資料補植方式一致，顧回傳imputer
+
+# KS Statistic 分析 區分好壞客戶比例 [max(|累積壞客戶比例 - 累積好客戶比例|)]
+
+# =============================
+
+# 0.1        幾乎沒用
+# 0.2-0.3    普通
+# 0.4-0.6    不錯
+# 0.6+       很好
+# 銀行多數為0.45~0.65
+# =============================
+
+def calc_ks(y_true: pd.Series, y_score: pd.Series) -> float:  # y_true:真實標籤、y_prob:模型預測機率
+    tmp = pd.DataFrame({"y": y_true, "score": y_score}).sort_values("score", ascending=False) # 照預測機率排序,fraud 最前面
+
+    # 計算總數
+    total_bad = (tmp["y"] == 1).sum()
+    total_good = (tmp["y"] == 0).sum()
+    # 防止極端情形 (避免分母為0)
+    if total_bad == 0 or total_good == 0:
+        return 0.0
+
+    # 累積比例
+    tmp["cum_bad"] = (tmp["y"] == 1).cumsum() / total_bad
+    tmp["cum_good"] = (tmp["y"] == 0).cumsum() / total_good
+    ks = (tmp["cum_bad"] - tmp["cum_good"]).abs().max()
+    return float(ks)
+
+
+# =========================
+# 3. 主流程
+# =========================
+def main() -> None:
+    # 讀 pkl
+    print("Loading pkl...")
+    with open(PKL_PATH, "rb") as f:
+        tables = pickle.load(f)
+
+    # 檢視是否正確讀取到正確的表
+    print("tables.keys:", tables.keys())
+    print("MAIN_TABLE_KEY:", MAIN_TABLE_KEY)
+    print("df.columns:", tables[MAIN_TABLE_KEY].columns.tolist())
+
+
+    if not isinstance(tables, dict):
+        raise TypeError("pkl 內容不是 dict，請先確認 pickle 結構")
+    # 找主表
+    df = find_main_table(tables).copy()
+    print_basic_info(df)
+
+    # ====== 時間切割 ======
+    # train:2025/4 ~ 2025/7
+    # test: 2025/8 ~ 2025/9
+
+    # 轉換日期型態
+    df["交易日期"] = pd.to_datetime(df["交易日期"], errors = "coerce")
+
+    # test 格式
+    print("交易日期 原始 dtype:", df["交易日期"].dtype)
+    print("交易日期 原始前20筆:")
+    print(df["交易日期"].head(20).tolist())
+    print("交易日期 原始去重前20筆:")
+    print(df["交易日期"].astype("string").drop_duplicates().head(20).tolist())
+
+    split_date = pd.Timestamp("2025-08-01")
+    print("交易日期 轉換後前20筆:")
+    print(df["交易日期"].head(20).tolist())
+    print("交易日期 NaT 筆數:", df["交易日期"].isna().sum())
+    print("交易日期 最小值:", df["交易日期"].min())
+    print("交易日期 最大值:", df["交易日期"].max())
+    print("交易日期月份分佈:")
+    print(df["交易日期"].dt.to_period("M").value_counts().sort_index())
+
+    train_df = df[df["交易日期"] < split_date].copy()
+    test_df = df[df["交易日期"] >= split_date].copy()
+
+    print("Train_period:", train_df["交易日期"].min(), "to", train_df["交易日期"].max())
+    print("Test_period:", test_df["交易日期"].min(), "to", test_df["交易日期"].max())
+    print("Train label distribution:")
+    print(train_df[LABEL_COL].value_counts(dropna=False))
+    print("Test label distribution:")
+    print(test_df[LABEL_COL].value_counts(dropna=False))
+    print("=" * 60)
+
+    # raise ValueError(值存在，但內容不合法): 主動丟出錯誤或停止程式  / raise keyError: 存取的key不存在
+    if train_df.empty or test_df.empty:
+        raise ValueError("train_df 或 test_df 為空，請確認split_date")
+
+    # 準備 X / y
+    X_train, y_train = prepare_xy(train_df)
+    X_test, y_test = prepare_xy(test_df)
+    print("Prepared X_train shape:", X_train.shape)
+    print("Prepared X_test shape:", X_test.shape)
+    print("Prepared y_train positive", int((y == 1).sum()))
+    print("Prepared y_test positive:", int((y == 1).sum()))
+    print("=" * 60)
+
+    # 補值中位數
+    imputer = SimpleImputer(strategy="median")
+    X_train_imputed = pd.DataFrame(
+        imputer.fit_transform(X_train),
+        columns = X_train.columns,
+        index = X_train.index
+    )
+    X_test_imputed = pd.DataFrame(
+        imputer.transform(X_test),
+        columns = X_test.columns,
+        index = X_test.index
+    )
+
+#    if y.nunique() < 2:
+#        raise ValueError("Label 只有單一類別，無法建模")
+
+    # 處理類別不平衡
+    pos_count = int((y_train == 1).sum())
+    neg_count = int((y_train == 0).sum())
+
+    if pos_count == 0:
+        raise ValueError("訓練集沒有正樣本，無法訓練")
+
+    scale_pos_weight = neg_count / pos_count
+    print("scale_pos_weight:", scale_pos_weight)
+    print("=" * 60)
+
+    # 建模
+    model = XGBClassifier(
+        n_estimators=300,
+        max_depth=6,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_weight=1,
+        reg_lambda=1.0,
+        objective="binary:logistic",
+        eval_metric="auc",
+        random_state=RANDOM_STATE,
+        scale_pos_weight=scale_pos_weight,
+        n_jobs=-1,
+    )
+    print("Training XGBoost...")
+    model.fit(X_train_imputed, y_train)
+    # AML leakage test
+    # y_train_shuffle = np.random.permutation(y_train)
+    #model.fit(X_train_imputed, y_train_shuffle) # SKY 2026/3/10
+
+    # 預測
+    y_pred = model.predict(X_test_imputed)
+    y_prob = model.predict_proba(X_test_imputed)[:, 1]
+
+    # 評估
+    auc = roc_auc_score(y_test, y_prob)
+    ks = calc_ks(y_test, y_prob)
+    cm = confusion_matrix(y_test, y_pred)
+
+    print("AUC:", round(auc, 6))
+    print("KS :", round(ks, 6))
+    print("=" * 60)
+    print("Confusion Matrix:")
+    print(cm)
+    print("=" * 60)
+    print("Classification Report:")
+    print(classification_report(y_test, y_pred, digits=4))
+    print("=" * 60)
+
+    # 預測分佈機率
+    print("Pred prob summary:")
+    print(pd.Series(y_prob).describe())
+    print("=" * 60)
+
+    # 特徵重要度
+    feature_importance = pd.DataFrame({
+        "feature": X_train_imputed.columns,
+        "importance": model.feature_importances_
+    }).sort_values("importance", ascending=False)
+
+    print("Top 20 Feature Importances:")
+    print(feature_importance.head(20))
+    print("=" * 60)
+
+    # 存檔
+    joblib.dump(
+        {
+        "model" : model,
+        "imputer" : imputer,
+        "features" : X_train_imputed.columns,
+        "split_date" : split_date
+        })
+    feature_importance.to_csv(FEATURE_IMPORTANCE_PATH, index = False, encoding = "utf-8-sig")
+    print("Model saved to:", MODEL_PATH)
+    print("Feature importance saved to:", FEATURE_IMPORTANCE_PATH)
+
+# 控制程式入口
+if __name__ == "__main__":   # 啟動開關
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
